@@ -13,7 +13,7 @@ provider "aws" {
 }
 
 variable "public_key" {
-  description = "SSH public key for EC2 access"
+  description = "SSH public key"
   type        = string
 }
 
@@ -117,19 +117,13 @@ resource "aws_security_group" "app_sg" {
   lifecycle {
     create_before_destroy = true
   }
-
-  tags = {
-    Name    = "${var.project_name}-${var.app_name}-sg"
-    Project = var.project_name
-    App     = var.app_name
-  }
 }
 
 resource "aws_instance" "app" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
   key_name                    = aws_key_pair.deployer.key_name
-  subnet_id                   = tolist(data.aws_subnets.default.ids)[0]
+  subnet_id                   = data.aws_subnets.default.ids[0]
   vpc_security_group_ids      = [aws_security_group.app_sg.id]
   associate_public_ip_address = true
 
@@ -139,10 +133,16 @@ resource "aws_instance" "app" {
   }
 
   tags = {
-    Name    = "${var.project_name}-${var.app_name}"
-    Project = var.project_name
-    App     = var.app_name
+    Name        = "${var.project_name}-${var.app_name}"
+    Project     = var.project_name
+    App         = var.app_name
+    ManagedBy   = "terraform"
   }
+}
+
+output "instance_ip" {
+  description = "Public IP address of the EC2 instance"
+  value       = aws_instance.app.public_ip
 }
 
 output "instance_id" {
@@ -150,17 +150,7 @@ output "instance_id" {
   value       = aws_instance.app.id
 }
 
-output "public_ip" {
-  description = "Public IP address of the EC2 instance"
-  value       = aws_instance.app.public_ip
-}
-
-output "public_dns" {
-  description = "Public DNS name of the EC2 instance"
+output "instance_dns" {
+  description = "Public DNS of the EC2 instance"
   value       = aws_instance.app.public_dns
-}
-
-output "ssh_command" {
-  description = "SSH command to connect to the instance"
-  value       = "ssh -i <private_key> ubuntu@${aws_instance.app.public_ip}"
 }
