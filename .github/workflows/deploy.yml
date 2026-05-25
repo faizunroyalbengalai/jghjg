@@ -1,0 +1,159 @@
+name: Deploy node to EC2
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    name: Provision EC2 with Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.server_ip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=us-east-1" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="public_key=${{ secrets.EC2_SSH_PUBLIC_KEY }}" \
+            -var="region=us-east-1" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}"
+
+      - name: Get server IP
+        id: get_ip
+        working-directory: terraform
+        run: |
+          echo "server_ip=$(terraform output -raw server_ip)" >> "$GITHUB_OUTPUT"
+
+  configure:
+    name: Configure EC2 with Ansible
+    runs-on: ubuntu-latest
+    needs: provision
+    env:
+      SERVER_IP: ${{ needs.provision.outputs.server_ip }}
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ansible
+        run: pip install ansible
+
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Wait for SSH to become available
+        run: |
+          echo "Waiting for SSH on $SERVER_IP..."
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/deploy_key ubuntu@$SERVER_IP "echo ready" 2>/dev/null; then
+              echo "SSH is available"
+              break
+            fi
+            echo "Attempt $i failed, retrying in 10 seconds..."
+            sleep 10
+          done
+
+      - name: Run Ansible playbook
+        run: |
+          ansible-playbook -i "$SERVER_IP," \
+            -u ubuntu \
+            --private-key /tmp/deploy_key \
+            -e "ansible_python_interpreter=/usr/bin/python3" \
+            -e "node_env_database_url='${{ secrets.DATABASE_URL }}'" \
+            -e "node_env_mongo_uri='${{ secrets.MONGO_URI }}'" \
+            -e "node_env_db_host='${{ secrets.DB_HOST }}'" \
+            -e "node_env_db_port='${{ secrets.DB_PORT }}'" \
+            -e "node_env_db_name='${{ secrets.DB_NAME }}'" \
+            -e "node_env_db_user='${{ secrets.DB_USER }}'" \
+            -e "node_env_db_password='${{ secrets.DB_PASSWORD }}'" \
+            -e "install_db='${{ secrets.INSTALL_DB_ON_EC2 }}'" \
+            -e "db_type='${{ secrets.DB_TYPE }}'" \
+            -e "db_name='${{ secrets.DB_NAME }}'" \
+            -e "db_username='${{ secrets.DB_USERNAME }}'" \
+            -e "db_password='${{ secrets.DB_PASSWORD }}'" \
+            ansible/playbook.yml
+
+  verify:
+    name: Verify deployment
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    env:
+      SERVER_IP: ${{ needs.provision.outputs.server_ip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ansible
+        run: pip install ansible
+
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      - name: Run verification playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook -i "$SERVER_IP," \
+            -u ubuntu \
+            --private-key /tmp/deploy_key \
+            -e "ansible_python_interpreter=/usr/bin/python3" \
+            ansible/verify.yml
+
+  notify:
+    name: Notify deployment result
+    runs-on: ubuntu-latest
+    needs: [provision, verify]
+    if: always()
+    steps:
+      - name: Deployment success
+        if: ${{ needs.verify.result == 'success' }}
+        run: |
+          echo "Deployment completed successfully!"
+          echo "Application is running at http://${{ needs.provision.outputs.server_ip }}"
+
+      - name: Deployment failure
+        if: ${{ needs.verify.result != 'success' }}
+        run: |
+          echo "Deployment failed. Please check the logs above."
+          exit 1
